@@ -176,7 +176,15 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    // MARK: - Text Mode Streaming State
+    // MARK: - Text Mode Input & Streaming State
+
+    /// Manages the focusable text input panel shown in text mode.
+    let textInputPanelManager = TextInputPanelManager()
+
+    /// When the last text mode response completed. Used to decide whether
+    /// ctrl+option triggers a fresh auto-analyze or a follow-up text input.
+    /// Follow-up input is shown only within 60 seconds of the last response.
+    private var lastTextModeResponseTime: Date?
 
     /// The accumulated text from Claude's streaming response in text mode.
     /// Observed by BlueCursorView to render the text bubble.
@@ -575,6 +583,7 @@ final class CompanionManager: ObservableObject {
             clearDetectedElementLocation()
             isShowingStreamingResponse = false
             streamingResponseText = ""
+            textInputPanelManager.hidePanel()
 
             // Dismiss the onboarding prompt if it's showing
             if showOnboardingPrompt {
@@ -608,8 +617,18 @@ final class CompanionManager: ObservableObject {
                     )
                 }
             } else {
-                // Text mode: screenshot + Claude + streaming text bubble (no audio)
-                sendScreenshotToClaudeWithTextResponse()
+                // Text mode: show follow-up text input if the last response
+                // was within 60 seconds. Otherwise, auto-analyze fresh.
+                let isWithinFollowUpWindow: Bool = {
+                    guard let lastResponseTime = lastTextModeResponseTime else { return false }
+                    return Date().timeIntervalSince(lastResponseTime) < 60
+                }()
+
+                if isWithinFollowUpWindow {
+                    showTextInputPanel()
+                } else {
+                    sendScreenshotToClaudeWithTextResponse()
+                }
             }
         case .released:
             if isVoiceModeEnabled {
@@ -847,15 +866,33 @@ final class CompanionManager: ObservableObject {
         print("🧠 Conversation history: \(conversationHistory.count) exchanges")
     }
 
+    // MARK: - Text Mode Input
+
+    /// Shows a focusable text input panel near the cursor. When the user
+    /// submits (Enter), sends the text + screenshot to Claude.
+    private func showTextInputPanel() {
+        textInputPanelManager.showNearCursor { [weak self] userText in
+            guard let self else {
+                print("📝 Text input callback: self is nil")
+                return
+            }
+            let prompt = userText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "What's on my screen? Help me with whatever I seem to be working on."
+                : userText.trimmingCharacters(in: .whitespacesAndNewlines)
+            print("📝 Sending text mode prompt: '\(prompt)'")
+            self.sendScreenshotToClaudeWithTextResponse(userPrompt: prompt)
+        }
+    }
+
     // MARK: - Text Mode Response Pipeline
 
-    /// Text mode: captures a screenshot, sends it to Claude with a default prompt,
+    /// Text mode: captures a screenshot, sends it to Claude with the given prompt,
     /// and streams the response as text in the cursor bubble. No audio recording or TTS.
-    private func sendScreenshotToClaudeWithTextResponse() {
+    private func sendScreenshotToClaudeWithTextResponse(userPrompt: String? = nil) {
         currentResponseTask?.cancel()
         elevenLabsTTSClient.stopPlayback()
 
-        let textModeUserPrompt = "What's on my screen? Help me with whatever I seem to be working on."
+        let textModeUserPrompt = userPrompt ?? "What's on my screen? Help me with whatever I seem to be working on."
 
         currentResponseTask = Task {
             voiceState = .processing
@@ -918,6 +955,8 @@ final class CompanionManager: ObservableObject {
                 appendToConversationHistory(userTranscript: textModeUserPrompt, assistantResponse: displayText)
 
                 ClickyAnalytics.trackAIResponseReceived(response: displayText)
+
+                lastTextModeResponseTime = Date()
 
                 // Auto-hide the text bubble after 10 seconds
                 try? await Task.sleep(nanoseconds: 10_000_000_000)
