@@ -336,6 +336,18 @@ struct BlueCursorView: View {
                 .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
                 .animation(.easeIn(duration: 0.15), value: companionManager.voiceState)
 
+            // Streaming text response bubble — shown in text mode when voice is off.
+            // Positioned to the right of and slightly below the cursor, clamped to screen edges.
+            if buddyIsVisibleOnThisScreen && companionManager.isShowingStreamingResponse {
+                StreamingTextResponseBubble(
+                    responseText: companionManager.streamingResponseText
+                )
+                .opacity(cursorOpacity)
+                .position(streamingTextBubblePosition)
+                .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
+                .transition(.opacity)
+            }
+
         }
         .frame(width: screenFrame.width, height: screenFrame.height)
         .ignoresSafeArea()
@@ -404,6 +416,43 @@ struct BlueCursorView: View {
         case .navigatingToTarget, .pointingAtTarget:
             return true
         }
+    }
+
+    // MARK: - Text Bubble Positioning
+
+    /// Computes the clamped position for the streaming text bubble so it stays
+    /// within the screen bounds. Prefers right-of-cursor, flips left if needed.
+    private var streamingTextBubblePosition: CGPoint {
+        let bubbleWidth: CGFloat = 300
+        let bubbleHeight: CGFloat = 200 // estimated max height
+        let offsetX: CGFloat = 30
+        let offsetY: CGFloat = 30
+        let margin: CGFloat = 10
+
+        var positionX = cursorPosition.x + offsetX + bubbleWidth / 2
+        var positionY = cursorPosition.y + offsetY
+
+        // If the bubble would go off the right edge, flip to the left of the cursor
+        if positionX + bubbleWidth / 2 + margin > screenFrame.width {
+            positionX = cursorPosition.x - offsetX - bubbleWidth / 2
+        }
+
+        // If the bubble would go off the left edge, clamp to left margin
+        if positionX - bubbleWidth / 2 < margin {
+            positionX = margin + bubbleWidth / 2
+        }
+
+        // If the bubble would go below the bottom edge, push it above the cursor
+        if positionY + bubbleHeight / 2 + margin > screenFrame.height {
+            positionY = cursorPosition.y - offsetY - bubbleHeight / 2
+        }
+
+        // Clamp top edge
+        if positionY - bubbleHeight / 2 < margin {
+            positionY = margin + bubbleHeight / 2
+        }
+
+        return CGPoint(x: positionX, y: positionY)
     }
 
     // MARK: - Cursor Tracking
@@ -770,6 +819,34 @@ private struct BlueCursorSpinnerView: View {
                     isSpinning = true
                 }
             }
+    }
+}
+
+// MARK: - Streaming Text Response Bubble
+
+/// Text bubble shown near the cursor in text mode. Displays Claude's streaming
+/// response with a dark translucent background, positioned to the right of the cursor.
+private struct StreamingTextResponseBubble: View {
+    let responseText: String
+
+    var body: some View {
+        Text(responseText.isEmpty ? "..." : responseText)
+            .font(.system(size: 13, weight: .regular))
+            .foregroundColor(.white)
+            .lineSpacing(3)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: 300, alignment: .leading)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(DS.Colors.surface1.opacity(0.95))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .stroke(DS.Colors.borderSubtle.opacity(0.5), lineWidth: 0.8)
+                    )
+                    .shadow(color: Color.black.opacity(0.35), radius: 16, x: 0, y: 8)
+            )
     }
 }
 

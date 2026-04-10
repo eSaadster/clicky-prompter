@@ -68,12 +68,28 @@ final class CompanionManager: ObservableObject {
     // Response text is now displayed inline on the cursor overlay via
     // streamingResponseText, so no separate response overlay manager is needed.
 
-    /// Base URL for the Cloudflare Worker proxy. All API requests route
-    /// through this so keys never ship in the app binary.
-    private static let workerBaseURL = "https://your-worker-name.your-subdomain.workers.dev"
+    /// Base URL for the Cloudflare Worker proxy. TTS and transcription
+    /// still route through this. Chat model endpoints come from models.json.
+    static let workerBaseURL = "https://your-worker-name.your-subdomain.workers.dev"
 
     private lazy var claudeAPI: ClaudeAPI = {
-        return ClaudeAPI(proxyURL: "\(Self.workerBaseURL)/chat", model: selectedModel)
+        // Look up the selected model configuration to get its endpoint and API key.
+        // If the persisted ID no longer exists in models.json, reset to the first
+        // available config so the UI and requests stay in sync.
+        var selectedConfiguration = modelConfigurationManager.configuration(forID: selectedModelConfigurationID)
+
+        if selectedConfiguration == nil, let firstAvailable = modelConfigurationManager.availableModelConfigurations.first {
+            print("⚠️ Persisted model config '\(selectedModelConfigurationID)' no longer exists — resetting to '\(firstAvailable.id)'")
+            selectedModelConfigurationID = firstAvailable.id
+            UserDefaults.standard.set(firstAvailable.id, forKey: "selectedModelConfigurationID")
+            selectedConfiguration = firstAvailable
+        }
+
+        let endpoint = selectedConfiguration?.apiEndpoint ?? "\(Self.workerBaseURL)/chat"
+        let modelID = selectedConfiguration?.modelID ?? "claude-sonnet-4-6"
+        let apiKey = selectedConfiguration?.apiKey.isEmpty == false ? selectedConfiguration?.apiKey : nil
+
+        return ClaudeAPI(proxyURL: endpoint, model: modelID, apiKey: apiKey)
     }()
 
     private lazy var elevenLabsTTSClient: ElevenLabsTTSClient = {
@@ -97,23 +113,84 @@ final class CompanionManager: ObservableObject {
     /// speaks again before the delay elapses.
     private var transientHideTask: Task<Void, Never>?
 
-    /// True when all three required permissions (accessibility, screen recording,
-    /// microphone) are granted. Used by the panel to show a single "all good" state.
+    /// True when all four required permissions (accessibility, screen recording,
+    /// microphone, screen content) are granted. Used by the panel to show a single "all good" state.
     var allPermissionsGranted: Bool {
-        hasAccessibilityPermission && hasScreenRecordingPermission && hasMicrophonePermission && hasScreenContentPermission
+        hasTextModePermissions && hasMicrophonePermission
     }
 
     /// Whether the blue cursor overlay is currently visible on screen.
     /// Used by the panel to show accurate status text ("Active" vs "Ready").
     @Published private(set) var isOverlayVisible: Bool = false
 
-    /// The Claude model used for voice responses. Persisted to UserDefaults.
-    @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedClaudeModel") ?? "claude-sonnet-4-6"
+    // MARK: - Model Configuration
 
-    func setSelectedModel(_ model: String) {
-        selectedModel = model
-        UserDefaults.standard.set(model, forKey: "selectedClaudeModel")
-        claudeAPI.model = model
+    /// Manages the user-editable models.json config file.
+    let modelConfigurationManager = ModelConfigurationManager()
+
+    /// The ID of the currently selected model configuration entry.
+    /// Persisted to UserDefaults so the choice survives app restarts.
+    @Published var selectedModelConfigurationID: String = UserDefaults.standard.string(forKey: "selectedModelConfigurationID") ?? "claude-sonnet"
+
+    /// Switches to a different model configuration. Looks up the config entry
+    /// and reconfigures the Claude API client with the new endpoint, model, and key.
+    func setSelectedModelConfiguration(_ configurationID: String) {
+        selectedModelConfigurationID = configurationID
+        UserDefaults.standard.set(configurationID, forKey: "selectedModelConfigurationID")
+
+        guard let modelConfiguration = modelConfigurationManager.configuration(forID: configurationID) else {
+            print("⚠️ Model configuration '\(configurationID)' not found in models.json")
+            return
+        }
+
+        claudeAPI.reconfigure(
+            proxyURL: modelConfiguration.apiEndpoint,
+            model: modelConfiguration.modelID,
+            apiKey: modelConfiguration.apiKey.isEmpty ? nil : modelConfiguration.apiKey
+        )
+    }
+
+    // MARK: - Voice Mode Toggle
+
+    /// Whether voice mode (push-to-talk recording, transcription, TTS) is enabled.
+    /// When disabled, the ctrl+option hotkey triggers text-only mode instead.
+    /// Persisted to UserDefaults.
+    @Published var isVoiceModeEnabled: Bool = UserDefaults.standard.object(forKey: "isVoiceModeEnabled") == nil
+        ? true
+        : UserDefaults.standard.bool(forKey: "isVoiceModeEnabled")
+
+    func setVoiceModeEnabled(_ enabled: Bool) {
+        isVoiceModeEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "isVoiceModeEnabled")
+
+        // If voice is being disabled, immediately stop any in-flight voice activity
+        if !enabled {
+            pendingKeyboardShortcutStartTask?.cancel()
+            pendingKeyboardShortcutStartTask = nil
+            buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
+            currentResponseTask?.cancel()
+            elevenLabsTTSClient.stopPlayback()
+            isShowingStreamingResponse = false
+            streamingResponseText = ""
+            voiceState = .idle
+        }
+    }
+
+    // MARK: - Text Mode Streaming State
+
+    /// The accumulated text from Claude's streaming response in text mode.
+    /// Observed by BlueCursorView to render the text bubble.
+    @Published var streamingResponseText: String = ""
+
+    /// Whether a streaming text response is currently being displayed.
+    /// Controls the text bubble visibility in the overlay.
+    @Published var isShowingStreamingResponse: Bool = false
+
+    // MARK: - Permissions
+
+    /// Permissions needed for text-only mode (no mic required).
+    var hasTextModePermissions: Bool {
+        hasAccessibilityPermission && hasScreenRecordingPermission && hasScreenContentPermission
     }
 
     /// User preference for whether the Clicky cursor should be shown.
@@ -183,11 +260,11 @@ final class CompanionManager: ObservableObject {
         // well before the onboarding demo fires at ~40s into the video.
         _ = claudeAPI
 
-        // If the user already completed onboarding AND all permissions are
-        // still granted, show the cursor overlay immediately. If permissions
-        // were revoked (e.g. signing change), don't show the cursor — the
-        // panel will show the permissions UI instead.
-        if hasCompletedOnboarding && allPermissionsGranted && isClickyCursorEnabled {
+        // If the user already completed onboarding AND the required permissions
+        // are granted, show the cursor overlay immediately. Text mode only needs
+        // text mode permissions; voice mode needs all permissions including mic.
+        let hasRequiredPermissions = isVoiceModeEnabled ? allPermissionsGranted : hasTextModePermissions
+        if hasCompletedOnboarding && hasRequiredPermissions && isClickyCursorEnabled {
             overlayWindowManager.hasShownOverlayBefore = true
             overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
             isOverlayVisible = true
@@ -382,7 +459,8 @@ final class CompanionManager: ObservableObject {
                     ClickyAnalytics.trackPermissionGranted(permission: "screen_content")
 
                     // If onboarding was already completed, show the cursor overlay now
-                    if hasCompletedOnboarding && allPermissionsGranted && !isOverlayVisible && isClickyCursorEnabled {
+                    let hasRequiredPermissions = isVoiceModeEnabled ? allPermissionsGranted : hasTextModePermissions
+                    if hasCompletedOnboarding && hasRequiredPermissions && !isOverlayVisible && isClickyCursorEnabled {
                         overlayWindowManager.hasShownOverlayBefore = true
                         overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
                         isOverlayVisible = true
@@ -495,6 +573,8 @@ final class CompanionManager: ObservableObject {
             currentResponseTask?.cancel()
             elevenLabsTTSClient.stopPlayback()
             clearDetectedElementLocation()
+            isShowingStreamingResponse = false
+            streamingResponseText = ""
 
             // Dismiss the onboarding prompt if it's showing
             if showOnboardingPrompt {
@@ -508,32 +588,41 @@ final class CompanionManager: ObservableObject {
             }
     
 
-            ClickyAnalytics.trackPushToTalkStarted()
+            if isVoiceModeEnabled {
+                // Voice mode: start recording and transcription
+                ClickyAnalytics.trackPushToTalkStarted()
 
-            pendingKeyboardShortcutStartTask?.cancel()
-            pendingKeyboardShortcutStartTask = Task {
-                await buddyDictationManager.startPushToTalkFromKeyboardShortcut(
-                    currentDraftText: "",
-                    updateDraftText: { _ in
-                        // Partial transcripts are hidden (waveform-only UI)
-                    },
-                    submitDraftText: { [weak self] finalTranscript in
-                        self?.lastTranscript = finalTranscript
-                        print("🗣️ Companion received transcript: \(finalTranscript)")
-                        ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
-                        self?.sendTranscriptToClaudeWithScreenshot(transcript: finalTranscript)
-                    }
-                )
+                pendingKeyboardShortcutStartTask?.cancel()
+                pendingKeyboardShortcutStartTask = Task {
+                    await buddyDictationManager.startPushToTalkFromKeyboardShortcut(
+                        currentDraftText: "",
+                        updateDraftText: { _ in
+                            // Partial transcripts are hidden (waveform-only UI)
+                        },
+                        submitDraftText: { [weak self] finalTranscript in
+                            self?.lastTranscript = finalTranscript
+                            print("🗣️ Companion received transcript: \(finalTranscript)")
+                            ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
+                            self?.sendTranscriptToClaudeWithScreenshot(transcript: finalTranscript)
+                        }
+                    )
+                }
+            } else {
+                // Text mode: screenshot + Claude + streaming text bubble (no audio)
+                sendScreenshotToClaudeWithTextResponse()
             }
         case .released:
-            // Cancel the pending start task in case the user released the shortcut
-            // before the async startPushToTalk had a chance to begin recording.
-            // Without this, a quick press-and-release drops the release event and
-            // leaves the waveform overlay stuck on screen indefinitely.
-            ClickyAnalytics.trackPushToTalkReleased()
-            pendingKeyboardShortcutStartTask?.cancel()
-            pendingKeyboardShortcutStartTask = nil
-            buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
+            if isVoiceModeEnabled {
+                // Cancel the pending start task in case the user released the shortcut
+                // before the async startPushToTalk had a chance to begin recording.
+                // Without this, a quick press-and-release drops the release event and
+                // leaves the waveform overlay stuck on screen indefinitely.
+                ClickyAnalytics.trackPushToTalkReleased()
+                pendingKeyboardShortcutStartTask?.cancel()
+                pendingKeyboardShortcutStartTask = nil
+                buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
+            }
+            // When voice is off, release is a no-op — the text overlay auto-hides
         case .none:
             break
         }
@@ -574,6 +663,32 @@ final class CompanionManager: ObservableObject {
     - user asks what html is: "html stands for hypertext markup language, it's basically the skeleton of every web page. curious how it connects to the css you're looking at? [POINT:none]"
     - user asks how to commit in xcode: "see that source control menu up top? click that and hit commit, or you can use command option c as a shortcut. [POINT:285,11:source control]"
     - element is on screen 2 (not where cursor is): "that's over on your other monitor — see the terminal window? [POINT:400,300:terminal:screen2]"
+    """
+
+    /// System prompt for text mode — optimized for reading rather than TTS.
+    /// Used when voice mode is off and the response streams as text in the cursor bubble.
+    private static let companionTextResponseSystemPrompt = """
+    you're clicky, a friendly always-on companion that lives in the user's menu bar. the user pressed a hotkey and you can see their screen(s). your reply will be displayed as text near their cursor, so write clearly and concisely for reading.
+
+    rules:
+    - keep responses short — a few sentences max. the text overlay is small.
+    - all lowercase, casual, warm. no emojis.
+    - be direct and helpful. reference what's on screen when relevant.
+    - no markdown headers, bullet lists, or heavy formatting — just clean, readable text.
+    - never say "simply" or "just".
+    - analyze what's on screen and provide useful context, tips, or help related to what the user seems to be doing.
+    - if you receive multiple screen images, the one labeled "primary focus" is where the cursor is — prioritize that one but reference others if relevant.
+
+    element pointing:
+    you have a small blue triangle cursor that can fly to and point at things on screen. use it whenever pointing would genuinely help the user — if they're asking how to do something, looking for a menu, trying to find a button, or need help navigating an app, point at the relevant element. err on the side of pointing rather than not pointing, because it makes your help way more useful and concrete.
+
+    don't point at things when it would be pointless — like if the conversation has nothing to do with what's on screen, or you'd just be pointing at something obvious they're already looking at.
+
+    when you point, append a coordinate tag at the very end of your response, AFTER your text. the screenshot images are labeled with their pixel dimensions. use those dimensions as the coordinate space. the origin (0,0) is the top-left corner of the image. x increases rightward, y increases downward.
+
+    format: [POINT:x,y:label] where x,y are integer pixel coordinates in the screenshot's coordinate space, and label is a short 1-3 word description of the element. if the element is on a DIFFERENT screen, append :screenN where N is the screen number from the image label.
+
+    if pointing wouldn't help, append [POINT:none].
     """
 
     // MARK: - AI Response Pipeline
@@ -622,78 +737,19 @@ final class CompanionManager: ObservableObject {
 
                 guard !Task.isCancelled else { return }
 
-                // Parse the [POINT:...] tag from Claude's response
+                // Parse the [POINT:...] tag and handle element pointing
                 let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
                 let spokenText = parseResult.spokenText
 
-                // Handle element pointing if Claude returned coordinates.
                 // Switch to idle BEFORE setting the location so the triangle
                 // becomes visible and can fly to the target. Without this, the
                 // spinner hides the triangle and the flight animation is invisible.
-                let hasPointCoordinate = parseResult.coordinate != nil
-                if hasPointCoordinate {
+                if parseResult.coordinate != nil {
                     voiceState = .idle
                 }
 
-                // Pick the screen capture matching Claude's screen number,
-                // falling back to the cursor screen if not specified.
-                let targetScreenCapture: CompanionScreenCapture? = {
-                    if let screenNumber = parseResult.screenNumber,
-                       screenNumber >= 1 && screenNumber <= screenCaptures.count {
-                        return screenCaptures[screenNumber - 1]
-                    }
-                    return screenCaptures.first(where: { $0.isCursorScreen })
-                }()
-
-                if let pointCoordinate = parseResult.coordinate,
-                   let targetScreenCapture {
-                    // Claude's coordinates are in the screenshot's pixel space
-                    // (top-left origin, e.g. 1280x831). Scale to the display's
-                    // point space (e.g. 1512x982), then convert to AppKit global coords.
-                    let screenshotWidth = CGFloat(targetScreenCapture.screenshotWidthInPixels)
-                    let screenshotHeight = CGFloat(targetScreenCapture.screenshotHeightInPixels)
-                    let displayWidth = CGFloat(targetScreenCapture.displayWidthInPoints)
-                    let displayHeight = CGFloat(targetScreenCapture.displayHeightInPoints)
-                    let displayFrame = targetScreenCapture.displayFrame
-
-                    // Clamp to screenshot coordinate space
-                    let clampedX = max(0, min(pointCoordinate.x, screenshotWidth))
-                    let clampedY = max(0, min(pointCoordinate.y, screenshotHeight))
-
-                    // Scale from screenshot pixels to display points
-                    let displayLocalX = clampedX * (displayWidth / screenshotWidth)
-                    let displayLocalY = clampedY * (displayHeight / screenshotHeight)
-
-                    // Convert from top-left origin (screenshot) to bottom-left origin (AppKit)
-                    let appKitY = displayHeight - displayLocalY
-
-                    // Convert display-local coords to global screen coords
-                    let globalLocation = CGPoint(
-                        x: displayLocalX + displayFrame.origin.x,
-                        y: appKitY + displayFrame.origin.y
-                    )
-
-                    detectedElementScreenLocation = globalLocation
-                    detectedElementDisplayFrame = displayFrame
-                    ClickyAnalytics.trackElementPointed(elementLabel: parseResult.elementLabel)
-                    print("🎯 Element pointing: (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y))) → \"\(parseResult.elementLabel ?? "element")\"")
-                } else {
-                    print("🎯 Element pointing: \(parseResult.elementLabel ?? "no element")")
-                }
-
-                // Save this exchange to conversation history (with the point tag
-                // stripped so it doesn't confuse future context)
-                conversationHistory.append((
-                    userTranscript: transcript,
-                    assistantResponse: spokenText
-                ))
-
-                // Keep only the last 10 exchanges to avoid unbounded context growth
-                if conversationHistory.count > 10 {
-                    conversationHistory.removeFirst(conversationHistory.count - 10)
-                }
-
-                print("🧠 Conversation history: \(conversationHistory.count) exchanges")
+                handleElementPointingFromResponse(parseResult: parseResult, screenCaptures: screenCaptures)
+                appendToConversationHistory(userTranscript: transcript, assistantResponse: spokenText)
 
                 ClickyAnalytics.trackAIResponseReceived(response: spokenText)
 
@@ -725,6 +781,190 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    // MARK: - Shared Response Helpers
+
+    /// Resolves Claude's [POINT:] coordinates to global screen coordinates and
+    /// triggers the cursor flight animation. Used by both voice and text response paths.
+    private func handleElementPointingFromResponse(
+        parseResult: PointingParseResult,
+        screenCaptures: [CompanionScreenCapture]
+    ) {
+        // Pick the screen capture matching Claude's screen number,
+        // falling back to the cursor screen if not specified.
+        let targetScreenCapture: CompanionScreenCapture? = {
+            if let screenNumber = parseResult.screenNumber,
+               screenNumber >= 1 && screenNumber <= screenCaptures.count {
+                return screenCaptures[screenNumber - 1]
+            }
+            return screenCaptures.first(where: { $0.isCursorScreen })
+        }()
+
+        if let pointCoordinate = parseResult.coordinate,
+           let targetScreenCapture {
+            // Claude's coordinates are in the screenshot's pixel space
+            // (top-left origin, e.g. 1280x831). Scale to the display's
+            // point space (e.g. 1512x982), then convert to AppKit global coords.
+            let screenshotWidth = CGFloat(targetScreenCapture.screenshotWidthInPixels)
+            let screenshotHeight = CGFloat(targetScreenCapture.screenshotHeightInPixels)
+            let displayWidth = CGFloat(targetScreenCapture.displayWidthInPoints)
+            let displayHeight = CGFloat(targetScreenCapture.displayHeightInPoints)
+            let displayFrame = targetScreenCapture.displayFrame
+
+            let clampedX = max(0, min(pointCoordinate.x, screenshotWidth))
+            let clampedY = max(0, min(pointCoordinate.y, screenshotHeight))
+
+            let displayLocalX = clampedX * (displayWidth / screenshotWidth)
+            let displayLocalY = clampedY * (displayHeight / screenshotHeight)
+
+            // Convert from top-left origin (screenshot) to bottom-left origin (AppKit)
+            let appKitY = displayHeight - displayLocalY
+
+            let globalLocation = CGPoint(
+                x: displayLocalX + displayFrame.origin.x,
+                y: appKitY + displayFrame.origin.y
+            )
+
+            detectedElementScreenLocation = globalLocation
+            detectedElementDisplayFrame = displayFrame
+            ClickyAnalytics.trackElementPointed(elementLabel: parseResult.elementLabel)
+            print("🎯 Element pointing: (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y))) → \"\(parseResult.elementLabel ?? "element")\"")
+        } else {
+            print("🎯 Element pointing: \(parseResult.elementLabel ?? "no element")")
+        }
+    }
+
+    /// Appends an exchange to conversation history and trims to the last 10 entries.
+    private func appendToConversationHistory(userTranscript: String, assistantResponse: String) {
+        conversationHistory.append((
+            userTranscript: userTranscript,
+            assistantResponse: assistantResponse
+        ))
+
+        if conversationHistory.count > 10 {
+            conversationHistory.removeFirst(conversationHistory.count - 10)
+        }
+
+        print("🧠 Conversation history: \(conversationHistory.count) exchanges")
+    }
+
+    // MARK: - Text Mode Response Pipeline
+
+    /// Text mode: captures a screenshot, sends it to Claude with a default prompt,
+    /// and streams the response as text in the cursor bubble. No audio recording or TTS.
+    private func sendScreenshotToClaudeWithTextResponse() {
+        currentResponseTask?.cancel()
+        elevenLabsTTSClient.stopPlayback()
+
+        let textModeUserPrompt = "What's on my screen? Help me with whatever I seem to be working on."
+
+        currentResponseTask = Task {
+            voiceState = .processing
+            streamingResponseText = ""
+            isShowingStreamingResponse = true
+
+            var hasReceivedFirstChunk = false
+
+            do {
+                let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+
+                guard !Task.isCancelled else {
+                    isShowingStreamingResponse = false
+                    return
+                }
+
+                let labeledImages = screenCaptures.map { capture in
+                    let dimensionInfo = " (image dimensions: \(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels) pixels)"
+                    return (data: capture.imageData, label: capture.label + dimensionInfo)
+                }
+
+                let historyForAPI = conversationHistory.map { entry in
+                    (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
+                }
+
+                let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
+                    images: labeledImages,
+                    systemPrompt: Self.companionTextResponseSystemPrompt,
+                    conversationHistory: historyForAPI,
+                    userPrompt: textModeUserPrompt,
+                    onTextChunk: { [weak self] accumulatedText in
+                        guard let self else { return }
+
+                        // On the first chunk, switch from spinner to idle so
+                        // the spinner stops rendering underneath the text bubble
+                        if !hasReceivedFirstChunk {
+                            hasReceivedFirstChunk = true
+                            self.voiceState = .idle
+                        }
+
+                        // Strip any partial [POINT:...] tag from the display text
+                        // so the user doesn't see the raw tag while it streams in
+                        let displayText = Self.stripPartialPointTag(from: accumulatedText)
+                        self.streamingResponseText = displayText
+                    }
+                )
+
+                guard !Task.isCancelled else {
+                    isShowingStreamingResponse = false
+                    return
+                }
+
+                let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
+                let displayText = parseResult.spokenText
+
+                // Update the final display text with the POINT tag fully stripped
+                streamingResponseText = displayText
+
+                handleElementPointingFromResponse(parseResult: parseResult, screenCaptures: screenCaptures)
+                appendToConversationHistory(userTranscript: textModeUserPrompt, assistantResponse: displayText)
+
+                ClickyAnalytics.trackAIResponseReceived(response: displayText)
+
+                // Auto-hide the text bubble after 10 seconds
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                if !Task.isCancelled {
+                    isShowingStreamingResponse = false
+                }
+
+            } catch is CancellationError {
+                isShowingStreamingResponse = false
+            } catch {
+                ClickyAnalytics.trackResponseError(error: error.localizedDescription)
+                print("⚠️ Text mode response error: \(error)")
+                streamingResponseText = "something went wrong. try again."
+                // Auto-hide the error after 4 seconds
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                if !Task.isCancelled {
+                    isShowingStreamingResponse = false
+                }
+            }
+
+            if !Task.isCancelled {
+                voiceState = .idle
+                scheduleTransientHideIfNeeded()
+            }
+        }
+    }
+
+    /// Strips a partially-streamed [POINT:...] tag from the end of accumulated text.
+    /// During streaming, the tag arrives character by character. This removes any
+    /// trailing partial match so the user doesn't see "[POINT:12" in the bubble.
+    private static func stripPartialPointTag(from text: String) -> String {
+        // Look for an unclosed "[POINT:" at the end of the text
+        guard let openBracketRange = text.range(of: "[POINT:", options: .backwards) else {
+            return text
+        }
+
+        // If there's a closing bracket after the opening, the tag is complete — keep it
+        // (it will be stripped by parsePointingCoordinates on the final text)
+        let afterOpenBracket = text[openBracketRange.upperBound...]
+        if afterOpenBracket.contains("]") {
+            return text
+        }
+
+        // Partial tag — strip everything from "[POINT:" onward
+        return String(text[..<openBracketRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     /// If the cursor is in transient mode (user toggled "Show Clicky" off),
     /// waits for TTS playback and any pointing animation to finish, then
     /// fades out the overlay after a 1-second pause. Cancelled automatically
@@ -736,6 +976,12 @@ final class CompanionManager: ObservableObject {
         transientHideTask = Task {
             // Wait for TTS audio to finish playing
             while elevenLabsTTSClient.isPlaying {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                guard !Task.isCancelled else { return }
+            }
+
+            // Wait for text mode streaming to finish
+            while isShowingStreamingResponse {
                 try? await Task.sleep(nanoseconds: 200_000_000)
                 guard !Task.isCancelled else { return }
             }

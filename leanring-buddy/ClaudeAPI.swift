@@ -6,17 +6,39 @@
 import Foundation
 
 /// Claude API helper with streaming for progressive text display.
+/// Supports reconfiguration at runtime so the user can switch between
+/// different Anthropic-compatible endpoints and models from the config file.
 class ClaudeAPI {
     private static let tlsWarmupLock = NSLock()
-    private static var hasStartedTLSWarmup = false
+    /// Tracks which hosts have already had TLS warmup fired, so we only
+    /// warm up once per distinct host even when the user switches models.
+    private static var hostsWithTLSWarmupStarted: Set<String> = []
 
-    private let apiURL: URL
+    private(set) var apiURL: URL
     var model: String
+    /// Optional API key sent as x-api-key header. When nil or empty, the
+    /// header is omitted (the Cloudflare Worker proxy injects its own key).
+    var apiKey: String?
     private let session: URLSession
 
-    init(proxyURL: String, model: String = "claude-sonnet-4-6") {
-        self.apiURL = URL(string: proxyURL)!
+    init(proxyURL: String, model: String = "claude-sonnet-4-6", apiKey: String? = nil) {
+        guard let parsedURL = URL(string: proxyURL) else {
+            print("⚠️ ClaudeAPI: invalid proxy URL '\(proxyURL)' — falling back to placeholder")
+            self.apiURL = URL(string: "https://invalid.endpoint.local")!
+            self.model = model
+            self.apiKey = apiKey
+            let config = URLSessionConfiguration.default
+            config.timeoutIntervalForRequest = 120
+            config.timeoutIntervalForResource = 300
+            config.waitsForConnectivity = true
+            config.urlCache = nil
+            config.httpCookieStorage = nil
+            self.session = URLSession(configuration: config)
+            return
+        }
+        self.apiURL = parsedURL
         self.model = model
+        self.apiKey = apiKey
 
         // Use .default instead of .ephemeral so TLS session tickets are cached.
         // Ephemeral sessions do a full TLS handshake on every request, which causes
@@ -36,11 +58,32 @@ class ClaudeAPI {
         warmUpTLSConnectionIfNeeded()
     }
 
+    /// Reconfigures the API client to point at a different endpoint, model,
+    /// and/or API key. Triggers TLS warmup for the new host if it hasn't
+    /// been warmed up yet.
+    func reconfigure(proxyURL: String, model: String, apiKey: String?) {
+        guard let parsedURL = URL(string: proxyURL) else {
+            print("⚠️ ClaudeAPI: invalid proxy URL '\(proxyURL)' — keeping current endpoint")
+            return
+        }
+        self.apiURL = parsedURL
+        self.model = model
+        self.apiKey = apiKey
+        warmUpTLSConnectionIfNeeded()
+    }
+
     private func makeAPIRequest() -> URLRequest {
         var request = URLRequest(url: apiURL)
         request.httpMethod = "POST"
         request.timeoutInterval = 120
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // When calling an endpoint directly (not through the Worker proxy),
+        // include the user-provided API key. The Worker ignores this header
+        // and injects its own key from secrets.
+        if let apiKey, !apiKey.isEmpty {
+            request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+            request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        }
         return request
     }
 
@@ -64,10 +107,12 @@ class ClaudeAPI {
     /// Sends a no-op HEAD request to the API host to establish and cache a TLS session.
     /// Failures are silently ignored — this is purely an optimization.
     private func warmUpTLSConnectionIfNeeded() {
+        guard let host = apiURL.host else { return }
+
         Self.tlsWarmupLock.lock()
-        let shouldStartTLSWarmup = !Self.hasStartedTLSWarmup
+        let shouldStartTLSWarmup = !Self.hostsWithTLSWarmupStarted.contains(host)
         if shouldStartTLSWarmup {
-            Self.hasStartedTLSWarmup = true
+            Self.hostsWithTLSWarmupStarted.insert(host)
         }
         Self.tlsWarmupLock.unlock()
 
@@ -181,9 +226,16 @@ class ClaudeAPI {
         var accumulatedResponseText = ""
 
         for try await line in byteStream.lines {
-            // SSE lines look like: "data: {...}"
-            guard line.hasPrefix("data: ") else { continue }
-            let jsonString = String(line.dropFirst(6)) // Drop "data: " prefix
+            // SSE lines look like "data: {...}" (Anthropic) or "data:{...}" (some proxies).
+            // Handle both formats.
+            let jsonString: String
+            if line.hasPrefix("data: ") {
+                jsonString = String(line.dropFirst(6))
+            } else if line.hasPrefix("data:") {
+                jsonString = String(line.dropFirst(5))
+            } else {
+                continue
+            }
 
             // End of stream marker
             guard jsonString != "[DONE]" else { break }

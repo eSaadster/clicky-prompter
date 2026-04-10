@@ -25,15 +25,21 @@ struct CompanionPanelView: View {
                 .padding(.top, 16)
                 .padding(.horizontal, 16)
 
-            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+            if companionManager.hasCompletedOnboarding && companionManager.hasTextModePermissions {
                 Spacer()
                     .frame(height: 12)
 
                 modelPickerRow
                     .padding(.horizontal, 16)
+
+                Spacer()
+                    .frame(height: 12)
+
+                voiceModeToggleRow
+                    .padding(.horizontal, 16)
             }
 
-            if !companionManager.allPermissionsGranted {
+            if !companionManager.hasTextModePermissions || (companionManager.isVoiceModeEnabled && !companionManager.hasMicrophonePermission) {
                 Spacer()
                     .frame(height: 16)
 
@@ -41,7 +47,7 @@ struct CompanionPanelView: View {
                     .padding(.horizontal, 16)
             }
 
-            if !companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+            if !companionManager.hasCompletedOnboarding && companionManager.hasTextModePermissions {
                 Spacer()
                     .frame(height: 16)
 
@@ -58,7 +64,7 @@ struct CompanionPanelView: View {
             //         .padding(.horizontal, 16)
             // }
 
-            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+            if companionManager.hasCompletedOnboarding && companionManager.hasTextModePermissions {
                 Spacer()
                     .frame(height: 16)
 
@@ -126,12 +132,14 @@ struct CompanionPanelView: View {
 
     @ViewBuilder
     private var permissionsCopySection: some View {
-        if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
-            Text("Hold Control+Option to talk.")
+        if companionManager.hasCompletedOnboarding && companionManager.hasTextModePermissions && (!companionManager.isVoiceModeEnabled || companionManager.hasMicrophonePermission) {
+            Text(companionManager.isVoiceModeEnabled
+                 ? "Hold Control+Option to talk."
+                 : "Press Control+Option to ask.")
                 .font(.system(size: 12, weight: .medium))
                 .foregroundColor(DS.Colors.textSecondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
-        } else if companionManager.allPermissionsGranted && !companionManager.hasSubmittedEmail {
+        } else if companionManager.hasTextModePermissions && (!companionManager.isVoiceModeEnabled || companionManager.hasMicrophonePermission) && !companionManager.hasSubmittedEmail {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Drop your email to get started.")
                     .font(.system(size: 12, weight: .medium))
@@ -141,7 +149,7 @@ struct CompanionPanelView: View {
                     .foregroundColor(DS.Colors.textTertiary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-        } else if companionManager.allPermissionsGranted {
+        } else if companionManager.hasTextModePermissions && (!companionManager.isVoiceModeEnabled || companionManager.hasMicrophonePermission) {
             Text("You're all set. Hit Start to meet Clicky.")
                 .font(.system(size: 12, weight: .medium))
                 .foregroundColor(DS.Colors.textSecondary)
@@ -183,7 +191,7 @@ struct CompanionPanelView: View {
 
     @ViewBuilder
     private var startButton: some View {
-        if !companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+        if !companionManager.hasCompletedOnboarding && companionManager.hasTextModePermissions && (!companionManager.isVoiceModeEnabled || companionManager.hasMicrophonePermission) {
             if !companionManager.hasSubmittedEmail {
                 VStack(spacing: 8) {
                     TextField("Enter your email", text: $emailInput)
@@ -250,7 +258,10 @@ struct CompanionPanelView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.bottom, 6)
 
-            microphonePermissionRow
+            // Only show mic permission row when voice mode is enabled
+            if companionManager.isVoiceModeEnabled {
+                microphonePermissionRow
+            }
 
             accessibilityPermissionRow
 
@@ -606,39 +617,74 @@ struct CompanionPanelView: View {
 
             Spacer()
 
-            HStack(spacing: 0) {
-                modelOptionButton(label: "Sonnet", modelID: "claude-sonnet-4-6")
-                modelOptionButton(label: "Opus", modelID: "claude-opus-4-6")
+            Menu {
+                ForEach(companionManager.modelConfigurationManager.availableModelConfigurations) { modelConfiguration in
+                    Button(action: {
+                        companionManager.setSelectedModelConfiguration(modelConfiguration.id)
+                    }) {
+                        HStack {
+                            Text(modelConfiguration.displayName)
+                            if companionManager.selectedModelConfigurationID == modelConfiguration.id {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Text(selectedModelDisplayName)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(DS.Colors.textPrimary)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundColor(DS.Colors.textTertiary)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.white.opacity(0.08))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+                )
             }
-            .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(Color.white.opacity(0.06))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
-            )
+            .menuStyle(.borderlessButton)
         }
         .padding(.vertical, 4)
     }
 
-    private func modelOptionButton(label: String, modelID: String) -> some View {
-        let isSelected = companionManager.selectedModel == modelID
-        return Button(action: {
-            companionManager.setSelectedModel(modelID)
-        }) {
-            Text(label)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundColor(isSelected ? DS.Colors.textPrimary : DS.Colors.textTertiary)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(
-                    RoundedRectangle(cornerRadius: 5, style: .continuous)
-                        .fill(isSelected ? Color.white.opacity(0.1) : Color.clear)
-                )
+    private var selectedModelDisplayName: String {
+        companionManager.modelConfigurationManager.availableModelConfigurations
+            .first(where: { $0.id == companionManager.selectedModelConfigurationID })?
+            .displayName ?? companionManager.selectedModelConfigurationID
+    }
+
+    // MARK: - Voice Mode Toggle
+
+    private var voiceModeToggleRow: some View {
+        HStack {
+            HStack(spacing: 8) {
+                Image(systemName: companionManager.isVoiceModeEnabled ? "speaker.wave.2" : "speaker.slash")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .frame(width: 16)
+                Text("Voice Mode")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+            }
+            Spacer()
+            Toggle("", isOn: Binding(
+                get: { companionManager.isVoiceModeEnabled },
+                set: { companionManager.setVoiceModeEnabled($0) }
+            ))
+            .toggleStyle(.switch)
+            .labelsHidden()
+            .tint(DS.Colors.accent)
+            .scaleEffect(0.8)
         }
-        .buttonStyle(.plain)
-        .pointerCursor()
+        .padding(.vertical, 4)
     }
 
     // MARK: - DM Farza Button
@@ -729,6 +775,9 @@ struct CompanionPanelView: View {
         if !companionManager.isOverlayVisible {
             return DS.Colors.textTertiary
         }
+        if companionManager.isShowingStreamingResponse {
+            return DS.Colors.blue400
+        }
         switch companionManager.voiceState {
         case .idle:
             return DS.Colors.success
@@ -740,11 +789,20 @@ struct CompanionPanelView: View {
     }
 
     private var statusText: String {
-        if !companionManager.hasCompletedOnboarding || !companionManager.allPermissionsGranted {
+        let hasRequiredPermissions = companionManager.isVoiceModeEnabled
+            ? companionManager.allPermissionsGranted
+            : companionManager.hasTextModePermissions
+
+        if !companionManager.hasCompletedOnboarding || !hasRequiredPermissions {
             return "Setup"
         }
         if !companionManager.isOverlayVisible {
             return "Ready"
+        }
+        // Text mode sets voiceState to .idle on first chunk to hide the spinner,
+        // so check isShowingStreamingResponse to show "Responding" during text streaming
+        if companionManager.isShowingStreamingResponse {
+            return "Responding"
         }
         switch companionManager.voiceState {
         case .idle:
