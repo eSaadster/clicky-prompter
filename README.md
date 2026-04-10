@@ -1,152 +1,124 @@
 # Hi, this is Clicky.
 It's an AI teacher that lives as a buddy next to your cursor. It can see your screen, talk to you, and even point at stuff. Kinda like having a real teacher next to you.
 
-Download it [here](https://www.clicky.so/) for free.
-
-Here's the [original tweet](https://x.com/FarzaTV/status/2041314633978659092) that kinda blew up for a demo for more context.
+This is a fork of the [original Clicky](https://github.com/farzaa/clicky) with some key changes:
+- **No Cloudflare Worker required** — TTS and STT call Smallest AI directly, chat models are configurable per-endpoint
+- **Configurable model picker** — supports any Anthropic-compatible API endpoint via a JSON config file
+- **Voice mode toggle** — switch between voice and text-only mode
+- **Text mode** — press ctrl+option to screenshot and get a streaming text response (no mic needed)
+- **Follow-up questions** — within 60 seconds of a response, press ctrl+option again to type a follow-up
 
 ![Clicky — an ai buddy that lives on your mac](clicky-demo.gif)
 
-This is the open-source version of Clicky for those that want to hack on it, build their own features, or just see how it works under the hood.
-
-## Get started with Claude Code
-
-The fastest way to get this running is with [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
-
-Once you get Claude running, paste this:
-
-```
-Hi Claude.
-
-Clone https://github.com/farzaa/clicky.git into my current directory.
-
-Then read the CLAUDE.md. I want to get Clicky running locally on my Mac.
-
-Help me set up everything — the Cloudflare Worker with my own API keys, the proxy URLs, and getting it building in Xcode. Walk me through it.
-```
-
-That's it. It'll clone the repo, read the docs, and walk you through the whole setup. Once you're running you can just keep talking to it — build features, fix bugs, whatever. Go crazy.
-
-## Manual setup
-
-If you want to do it yourself, here's the deal.
+## Get started
 
 ### Prerequisites
 
 - macOS 14.2+ (for ScreenCaptureKit)
 - Xcode 15+
-- Node.js 18+ (for the Cloudflare Worker)
-- A [Cloudflare](https://cloudflare.com) account (free tier works)
-- API keys for: [Anthropic](https://console.anthropic.com), [AssemblyAI](https://www.assemblyai.com), [ElevenLabs](https://elevenlabs.io)
+- A [Smallest AI](https://app.smallest.ai/dashboard) API key (for voice mode TTS + STT)
+- At least one Anthropic-compatible API endpoint and key for chat (e.g. Anthropic, Alibaba DashScope, Z.AI)
 
-### 1. Set up the Cloudflare Worker
-
-The Worker is a tiny proxy that holds your API keys. The app talks to the Worker, the Worker talks to the APIs. This way your keys never ship in the app binary.
+### 1. Clone and open in Xcode
 
 ```bash
-cd worker
-npm install
-```
-
-Now add your secrets. Wrangler will prompt you to paste each one:
-
-```bash
-npx wrangler secret put ANTHROPIC_API_KEY
-npx wrangler secret put ASSEMBLYAI_API_KEY
-npx wrangler secret put ELEVENLABS_API_KEY
-```
-
-For the ElevenLabs voice ID, open `wrangler.toml` and set it there (it's not sensitive):
-
-```toml
-[vars]
-ELEVENLABS_VOICE_ID = "your-voice-id-here"
-```
-
-Deploy it:
-
-```bash
-npx wrangler deploy
-```
-
-It'll give you a URL like `https://your-worker-name.your-subdomain.workers.dev`. Copy that.
-
-### 2. Run the Worker locally (for development)
-
-If you want to test changes to the Worker without deploying:
-
-```bash
-cd worker
-npx wrangler dev
-```
-
-This starts a local server (usually `http://localhost:8787`) that behaves exactly like the deployed Worker. You'll need to create a `.dev.vars` file in the `worker/` directory with your keys:
-
-```
-ANTHROPIC_API_KEY=sk-ant-...
-ASSEMBLYAI_API_KEY=...
-ELEVENLABS_API_KEY=...
-ELEVENLABS_VOICE_ID=...
-```
-
-Then update the proxy URLs in the Swift code to point to `http://localhost:8787` instead of the deployed Worker URL while developing. Grep for `clicky-proxy` to find them all.
-
-### 3. Update the proxy URLs in the app
-
-The app has the Worker URL hardcoded in a few places. Search for `your-worker-name.your-subdomain.workers.dev` and replace it with your Worker URL:
-
-```bash
-grep -r "clicky-proxy" leanring-buddy/
-```
-
-You'll find it in:
-- `CompanionManager.swift` — Claude chat + ElevenLabs TTS
-- `AssemblyAIStreamingTranscriptionProvider.swift` — AssemblyAI token endpoint
-
-### 4. Open in Xcode and run
-
-```bash
+git clone https://github.com/eSaadster/clicky-prompter.git
+cd clicky-prompter
 open leanring-buddy.xcodeproj
 ```
 
 In Xcode:
 1. Select the `leanring-buddy` scheme (yes, the typo is intentional, long story)
-2. Set your signing team under Signing & Capabilities
+2. Set your signing team under **Signing & Capabilities**
 3. Hit **Cmd + R** to build and run
 
-The app will appear in your menu bar (not the dock). Click the icon to open the panel, grant the permissions it asks for, and you're good.
+The app will appear in your menu bar (not the dock). Click the icon to open the panel and grant the permissions it asks for.
 
-### Permissions the app needs
+### 2. Configure your API keys
 
-- **Microphone** — for push-to-talk voice capture
-- **Accessibility** — for the global keyboard shortcut (Control + Option)
+On first launch, the app creates config files in `~/Library/Application Support/Clicky/`. Open that directory:
+
+```bash
+open ~/Library/Application\ Support/Clicky/
+```
+
+**config.json** — Smallest AI API key for voice mode (TTS + STT):
+
+```json
+{
+  "smallestAIApiKey": "your-smallest-ai-key-here",
+  "ttsVoiceId": "emily"
+}
+```
+
+Get your API key at [app.smallest.ai/dashboard](https://app.smallest.ai/dashboard). Available voices include `emily`, `noah`, `daniel`, `magnus`, and [many more](https://docs.smallest.ai).
+
+**models.json** — Chat model endpoints (supports any Anthropic-compatible API):
+
+```json
+[
+  {
+    "id": "claude-sonnet",
+    "displayName": "Sonnet",
+    "modelID": "claude-sonnet-4-6",
+    "apiEndpoint": "https://api.anthropic.com/v1/messages",
+    "apiKey": "your-anthropic-key-here"
+  }
+]
+```
+
+You can add as many models as you want — each can point to a different endpoint. They'll all show up in the model picker dropdown.
+
+### 3. Restart the app
+
+After editing the config files, restart the app (quit from the menu bar panel, then Cmd+R in Xcode). The model picker will show your configured models, and voice mode will use Smallest AI.
+
+## How it works
+
+### Voice mode (default)
+Hold **ctrl+option** to talk. Release to send your voice + screenshot to the AI. It responds with text-to-speech audio and can point at things on your screen.
+
+### Text mode
+Toggle voice off in the menu bar panel. Press **ctrl+option** to screenshot and get a streaming text response in a bubble near your cursor. Press again within 60 seconds to type a follow-up question.
+
+## Permissions the app needs
+
+- **Accessibility** — for the global keyboard shortcut (ctrl+option)
 - **Screen Recording** — for taking screenshots when you use the hotkey
-- **Screen Content** — for ScreenCaptureKit access
+- **Microphone** — for push-to-talk voice capture (only needed in voice mode)
 
 ## Architecture
 
-If you want the full technical breakdown, read `CLAUDE.md`. But here's the short version:
+**Menu bar app** (no dock icon) with two `NSPanel` windows — one for the control panel dropdown, one for the full-screen transparent cursor overlay.
 
-**Menu bar app** (no dock icon) with two `NSPanel` windows — one for the control panel dropdown, one for the full-screen transparent cursor overlay. Push-to-talk streams audio over a websocket to AssemblyAI, sends the transcript + screenshot to Claude via streaming SSE, and plays the response through ElevenLabs TTS. Claude can embed `[POINT:x,y:label:screenN]` tags in its responses to make the cursor fly to specific UI elements across multiple monitors. All three APIs are proxied through a Cloudflare Worker.
+- **Chat**: Any Anthropic-compatible model via configurable endpoints in `models.json`
+- **TTS**: Smallest AI Lightning v3.1 — direct API call, ~100ms latency
+- **STT**: Smallest AI Pulse — upload-based transcription on push-to-talk release
+- **Fallback STT**: AssemblyAI (real-time streaming), OpenAI, Apple Speech
+
+Claude can embed `[POINT:x,y:label:screenN]` tags in responses to make the cursor fly to specific UI elements across multiple monitors.
+
+For the full technical breakdown, read `CLAUDE.md`.
 
 ## Project structure
 
 ```
-leanring-buddy/          # Swift source (yes, the typo stays)
-  CompanionManager.swift    # Central state machine
-  CompanionPanelView.swift  # Menu bar panel UI
-  ClaudeAPI.swift           # Claude streaming client
-  ElevenLabsTTSClient.swift # Text-to-speech playback
-  OverlayWindow.swift       # Blue cursor overlay
-  AssemblyAI*.swift         # Real-time transcription
-  BuddyDictation*.swift     # Push-to-talk pipeline
-worker/                  # Cloudflare Worker proxy
-  src/index.ts              # Three routes: /chat, /tts, /transcribe-token
-CLAUDE.md                # Full architecture doc (agents read this)
+leanring-buddy/              # Swift source (yes, the typo stays)
+  CompanionManager.swift       # Central state machine
+  CompanionPanelView.swift     # Menu bar panel UI
+  ClaudeAPI.swift              # Claude streaming client
+  SmallestAITTSClient.swift    # Text-to-speech (Smallest AI Lightning)
+  SmallestAITranscriptionProvider.swift  # Speech-to-text (Smallest AI Pulse)
+  OverlayWindow.swift          # Blue cursor overlay
+  BuddyDictation*.swift        # Push-to-talk pipeline
+  ModelConfiguration.swift     # models.json reader
+  ProviderConfiguration.swift  # config.json reader
+worker/                      # Cloudflare Worker proxy (legacy, optional)
+CLAUDE.md                    # Full architecture doc
 ```
 
 ## Contributing
 
 PRs welcome. If you're using Claude Code, it already knows the codebase — just tell it what you want to build and point it at `CLAUDE.md`.
 
-Got feedback? DM me on X [@farzatv](https://x.com/farzatv).
+Originally built by [@farzatv](https://x.com/farzatv). This fork by [@eSaadster](https://github.com/eSaadster).
