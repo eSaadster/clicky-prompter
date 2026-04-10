@@ -44,8 +44,7 @@ struct ModelProviderConfiguration: Codable, Identifiable, Equatable {
 final class ModelConfigurationManager: ObservableObject {
     @Published private(set) var availableModelConfigurations: [ModelProviderConfiguration] = []
 
-    /// The default Worker base URL placeholder. Matches the value previously
-    /// hardcoded in CompanionManager.workerBaseURL.
+    /// The default Worker base URL placeholder used in default model configs.
     private static let defaultWorkerBaseURL = "https://your-worker-name.your-subdomain.workers.dev"
 
     private static let defaultModelConfigurations: [ModelProviderConfiguration] = [
